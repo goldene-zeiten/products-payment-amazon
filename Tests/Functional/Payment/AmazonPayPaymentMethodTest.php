@@ -14,12 +14,14 @@ use GoldeneZeiten\Products\Core\Domain\ValueObject\Money;
 use GoldeneZeiten\Products\Payment\Amazon\Configuration\AmazonPayConfigurationFactory;
 use GoldeneZeiten\Products\Payment\Amazon\Payment\AmazonPayPaymentMethod;
 use GoldeneZeiten\Products\Payment\Amazon\Tests\Functional\AbstractAmazonPayMockTestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Log\NullLogger;
 use TYPO3\CMS\Core\Configuration\ExtensionConfiguration;
 use TYPO3\CMS\Core\Http\ServerRequest;
+use TYPO3\CMS\Core\Site\Entity\Site;
 
 final class AmazonPayPaymentMethodTest extends AbstractAmazonPayMockTestCase
 {
@@ -83,11 +85,105 @@ final class AmazonPayPaymentMethodTest extends AbstractAmazonPayMockTestCase
     }
 
     #[Test]
-    public function handleWebhookStaysPendingWithoutASessionId(): void
+    public function handleWebhookLeavesThePaymentUnchangedWithoutASessionId(): void
     {
         $result = $this->subject()->handleWebhook(new ServerRequest('https://shop.example/webhook', 'POST'), $this->order());
 
-        $this->assertSame(PaymentResultState::PENDING, $result->getState());
+        $this->assertSame(PaymentResultState::UNCHANGED, $result->getState());
+    }
+
+    #[Test]
+    public function handleWebhookMarksPaidForACompletedSessionOfThisOrder(): void
+    {
+        $result = $this->subject()->handleWebhook($this->webhookRequest('amzn_session_paid'), $this->order());
+
+        $this->assertSame(PaymentStatus::PAID, $result->getPaymentStatus());
+    }
+
+    /**
+     * The session id comes from the caller. A completed session of a different order - or of this order at
+     * a different amount - proves nothing about this order and must not mark it paid.
+     */
+    #[Test]
+    #[DataProvider('foreignSessions')]
+    public function handleWebhookDoesNotMarkPaidForACompletedSessionThatIsNotThisOrders(string $sessionId): void
+    {
+        $result = $this->subject()->handleWebhook($this->webhookRequest($sessionId), $this->order());
+
+        $this->assertNotSame(PaymentStatus::PAID, $result->getPaymentStatus());
+    }
+
+    #[Test]
+    #[DataProvider('foreignSessions')]
+    public function theResultLegDoesNotSettleTheOrderWithASessionThatIsNotItsOwn(string $sessionId): void
+    {
+        $result = $this->subject()->handleReturn($this->returnRequest('result', $sessionId), $this->order());
+
+        $this->assertSame(PaymentResultState::FAILED, $result->getState());
+        $this->assertSame(0, $this->recordedRequests('/payment/amazon/v2/checkoutSessions/' . $sessionId . '/complete'));
+    }
+
+    public static function foreignSessions(): \Generator
+    {
+        yield 'a session of another order' => [
+            'sessionId' => 'amzn_session_foreign',
+        ];
+        yield 'a session of this order at another amount' => [
+            'sessionId' => 'amzn_session_cheap',
+        ];
+    }
+
+    /**
+     * Gateway callbacks run as middlewares before the page is resolved, where core has not published the
+     * request globally yet. Credentials configured only on the site must still be found - from the site of
+     * the callback request itself.
+     */
+    #[Test]
+    public function theResultLegUsesTheCredentialsOfTheRequestsSite(): void
+    {
+        $subject = new AmazonPayPaymentMethod(
+            new AmazonPayConfigurationFactory($this->siteOnlyConfiguration(), new CurrentSiteResolver()),
+            $this->client(),
+            $this->get(EventDispatcherInterface::class),
+            new NullLogger(),
+        );
+
+        $result = $subject->handleReturn($this->siteOnlyRequest($this->returnRequest('result')), $this->order());
+
+        $this->assertSame(PaymentStatus::PAID, $result->getPaymentStatus());
+    }
+
+    private function siteOnlyRequest(ServerRequestInterface $request): ServerRequestInterface
+    {
+        unset($GLOBALS['TYPO3_REQUEST']);
+        $site = new Site('shop', 1, [
+            'base' => 'https://shop.example/',
+            'settings' => [
+                'products' => [
+                    'payment' => [
+                        'amazon' => [
+                            'region' => 'eu',
+                            'environment' => 'sandbox',
+                            'publicKeyId' => 'SANDBOX-AMZN-TEST-KEY',
+                            'privateKey' => (string)file_get_contents(__DIR__ . '/../Fixtures/test_private_key.pem'),
+                            'storeId' => 'amzn1.application-oa2-client.test',
+                            'merchantStoreName' => 'Test Shop',
+                            'apiBaseUrl' => $this->mockRoot . '/payment/amazon',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        return $request->withAttribute('site', $site);
+    }
+
+    private function siteOnlyConfiguration(): ApiSettingsResolver
+    {
+        $extensionConfiguration = $this->createMock(ExtensionConfiguration::class);
+        $extensionConfiguration->method('get')->willReturn([]);
+
+        return new ApiSettingsResolver($extensionConfiguration);
     }
 
     private function subject(): AmazonPayPaymentMethod
@@ -116,10 +212,16 @@ final class AmazonPayPaymentMethodTest extends AbstractAmazonPayMockTestCase
         return new AmazonPayConfigurationFactory(new ApiSettingsResolver($extensionConfiguration), new CurrentSiteResolver());
     }
 
-    private function returnRequest(string $leg): ServerRequestInterface
+    private function returnRequest(string $leg, string $sessionId = 'amzn_session_1'): ServerRequestInterface
     {
-        return (new ServerRequest('https://shop.example/products/payment/return?order=1&signature=sig&leg=' . $leg . '&amazonCheckoutSessionId=amzn_session_1', 'GET'))
-            ->withQueryParams(['order' => '1', 'signature' => 'sig', 'leg' => $leg, 'amazonCheckoutSessionId' => 'amzn_session_1']);
+        return (new ServerRequest('https://shop.example/products/payment/return?order=1&signature=sig&leg=' . $leg . '&amazonCheckoutSessionId=' . $sessionId, 'GET'))
+            ->withQueryParams(['order' => '1', 'signature' => 'sig', 'leg' => $leg, 'amazonCheckoutSessionId' => $sessionId]);
+    }
+
+    private function webhookRequest(string $sessionId): ServerRequestInterface
+    {
+        return (new ServerRequest('https://shop.example/products/payment/webhook?order=1&signature=sig&amazonCheckoutSessionId=' . $sessionId, 'POST'))
+            ->withQueryParams(['order' => '1', 'signature' => 'sig', 'amazonCheckoutSessionId' => $sessionId]);
     }
 
     private function order(): Order
